@@ -1,11 +1,16 @@
 import os
 import time
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from concurrent.futures import ThreadPoolExecutor
+from pyrogram.raw.functions.upload import GetFile
+from pyrogram.raw.types import InputDocumentFileLocation
+from pyrogram.errors import FloodWait
+
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
-from uploader import upload_to_abyss  # your existing uploader.py
+from uploader import upload_to_abyss
 
 bot = Client(
     "abyss-bot",
@@ -26,7 +31,6 @@ def human_readable(size):
         size /= 1024
 
 def safe_asyncio_task(coro):
-    """Schedule an async coroutine safely from a thread."""
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -34,7 +38,6 @@ def safe_asyncio_task(coro):
     return asyncio.run_coroutine_threadsafe(coro, loop)
 
 async def edit_download_progress(message: Message, tag: str, current: int, total: int, start_time: float, last_update: dict):
-    """Edit message with download progress, speed, ETA."""
     now = time.time()
     last_time, last_bytes = last_update.get(message.id, (start_time, 0))
     if now - last_time < 1 and current != total:
@@ -67,6 +70,54 @@ def upload_file(file_path: str):
     return slug, elapsed, speed
 
 # ----------------------
+# Fast multi-part download
+# ----------------------
+async def fast_download(client, message, file_path, parts=3, progress_callback=None):
+    media = message.document or message.video
+    size = media.file_size
+    block_size = 512 * 1024  # 512 KB per chunk
+
+    # Get raw location
+    file_location = InputDocumentFileLocation(
+        id=media.file_id,
+        access_hash=media.file_access_hash,
+        file_reference=media.file_reference,
+        thumb_size=""
+    )
+
+    # Prepare per-part ranges
+    part_size = size // parts
+    part_ranges = [(i * part_size, size if i == parts-1 else (i+1) * part_size) for i in range(parts)]
+    bytes_downloaded = [0] * parts
+
+    async def download_part(idx, start, stop):
+        offset = start
+        with open(f"{file_path}.part{idx}", "wb") as f:
+            while offset < stop:
+                limit = min(block_size, stop - offset)
+                try:
+                    r = await client.invoke(GetFile(location=file_location, offset=offset, limit=limit))
+                except FloodWait as e:
+                    await asyncio.sleep(e.x)
+                    continue
+                f.write(r.bytes)
+                offset += len(r.bytes)
+                bytes_downloaded[idx] = offset - start
+                if progress_callback:
+                    total_downloaded = sum(bytes_downloaded)
+                    await progress_callback(total_downloaded, size)
+
+    # Run all parts in parallel
+    await asyncio.gather(*[download_part(i, s, e) for i, (s, e) in enumerate(part_ranges)])
+
+    # Combine parts
+    with open(file_path, "wb") as final:
+        for i in range(parts):
+            with open(f"{file_path}.part{i}", "rb") as part_file:
+                final.write(part_file.read())
+            os.remove(f"{file_path}.part{i}")
+
+# ----------------------
 # Handler
 # ----------------------
 @bot.on_message(filters.video | filters.document)
@@ -89,8 +140,7 @@ async def handle_file(client, message: Message):
         async def progress_callback(current, total):
             await edit_download_progress(status, "Downloading", current, total, start_time, last_update)
 
-        file_path = await message.download(file_name=file_path, progress=progress_callback)
-
+        await fast_download(client, message, file_path, parts=3, progress_callback=progress_callback)
         await status.edit_text(f"✅ Downloaded {file.file_name} ({human_readable(os.path.getsize(file_path))})")
 
         # ------------------
