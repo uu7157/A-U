@@ -4,9 +4,9 @@ import sys
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from concurrent.futures import ThreadPoolExecutor
-from uploader import upload_to_abyss
-from custom_dl import TGCustomYield  # raw DC downloader
 
+from uploader import upload_to_abyss  # your existing uploader.py
+from custom_dl import TGCustomYield  # DC streaming downloader
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
 
 bot = Client("abyss-bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -16,14 +16,16 @@ upload_executor = ThreadPoolExecutor(max_workers=3)
 # ----------------------
 # Utilities
 # ----------------------
-def human_readable(size):
+def human_readable(size: float) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
+    return f"{size:.2f} PB"
 
 
 async def safe_edit(message: Message, text: str):
+    """Safe edit to avoid flooding or exceptions."""
     try:
         await message.edit_text(text)
     except Exception:
@@ -41,12 +43,15 @@ async def stream_telegram_to_abyss(message: Message):
     status = await message.reply_text(f"Preparing {file.file_name}...", quote=True)
 
     try:
-        downloader = TGCustomYield(bot)  # pass bot instance
+        downloader = TGCustomYield(bot)
+
         total_size = getattr(file, "file_size", 0)
         downloaded = 0
         start_time = time.time()
 
-        # Generator yielding chunks from Telegram DC
+        # ----------------------
+        # Async generator yielding chunks
+        # ----------------------
         async def chunk_generator():
             nonlocal downloaded
             async for chunk in downloader.yield_file(
@@ -59,41 +64,29 @@ async def stream_telegram_to_abyss(message: Message):
             ):
                 downloaded += len(chunk)
                 percent = int(downloaded * 100 / total_size) if total_size else 0
-                speed = human_readable(downloaded / (time.time() - start_time)) if downloaded else "0 B"
-                eta = int((total_size - downloaded) / (downloaded / (time.time() - start_time))) if downloaded else "-"
+                elapsed = max(time.time() - start_time, 0.001)
+                speed = downloaded / elapsed
+                eta = int((total_size - downloaded) / speed) if downloaded else "-"
                 await safe_edit(
                     status,
                     f"Downloading {file.file_name}: {percent}%\n"
-                    f"Speed: {speed}/s\nETA: {eta}s"
+                    f"Speed: {speed / 1024 / 1024:.2f} MB/s\nETA: {eta}s"
                 )
                 yield chunk
 
-        # Wrapper for streaming to requests
-        class StreamFile:
-            def __init__(self, gen):
-                self.gen = gen.__aiter__()
-
-            def read(self, n=-1):
-                try:
-                    return asyncio.run(self.gen.__anext__())
-                except StopAsyncIteration:
-                    return b""
-
-        stream_file = StreamFile(chunk_generator())
-
-        # Upload in thread executor
-        loop = asyncio.get_event_loop()
-        start_upload = time.time()
-        slug = await loop.run_in_executor(
-            upload_executor,
-            lambda: upload_to_abyss(file_like=stream_file, api_key=ABYSS_API)
+        # ----------------------
+        # Upload to Abyss
+        # ----------------------
+        slug = await upload_to_abyss(
+            file_generator=chunk_generator(),  # async generator
+            api_key=ABYSS_API,
+            progress_callback=None  # optional: can add upload progress
         )
-        elapsed_upload = time.time() - start_upload
 
+        elapsed = int(time.time() - start_time)
         await safe_edit(
             status,
-            f"✅ Uploaded!\nhttps://zplayer.io/?v={slug}\n"
-            f"Total Time: {int(elapsed_upload)}s"
+            f"✅ Uploaded!\nhttps://zplayer.io/?v={slug}\nTime: {elapsed}s"
         )
 
     except Exception as e:
@@ -101,10 +94,17 @@ async def stream_telegram_to_abyss(message: Message):
         await safe_edit(status, f"❌ Failed: {e}")
 
 
+# ----------------------
+# Message handler
+# ----------------------
 @bot.on_message(filters.video | filters.document)
 async def handle_message(client, message: Message):
+    # Each file handled in its own async task
     asyncio.create_task(stream_telegram_to_abyss(message))
 
 
+# ----------------------
+# Run bot
+# ----------------------
 if __name__ == "__main__":
     bot.run()
