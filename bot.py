@@ -4,9 +4,9 @@ import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from concurrent.futures import ThreadPoolExecutor
-import requests
 
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
+from uploader import upload_to_abyss  # use your existing uploader.py
 
 bot = Client(
     "abyss-bot",
@@ -16,8 +16,11 @@ bot = Client(
 )
 
 upload_executor = ThreadPoolExecutor(max_workers=3)
-progress_data = {}
+progress_data = {}  # track progress per message
 
+# ----------------------
+# Utilities
+# ----------------------
 def human_readable(size):
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
@@ -55,53 +58,83 @@ async def edit_progress(message: Message, tag: str, current, total, last_update)
 
     last_update[message.id] = (now, current)
 
-def upload_to_abyss(file_path: str, api_key: str):
-    url = f"http://up.hydrax.net/{api_key}"
-    with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f, "video/mp4")}
-        response = requests.post(url, files=files)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("url") or data.get("slug")
+# ----------------------
+# Wrapper for upload with live progress
+# ----------------------
+def upload_with_progress(file_path, api_key, callback=None):
+    total_size = os.path.getsize(file_path)
+    chunk_size = 1024 * 1024  # 1 MB chunks
+    uploaded = 0
 
-async def download_file(client: Client, file, status: Message):
-    """Manual chunked download for speed + progress"""
-    file_info = await client.get_file(file.file_id)
-    total = file_info.file_size
-    file_path = f"./downloads/{file.file_name}"
+    # We wrap the file object to track progress while reading
+    class ProgressFile:
+        def __init__(self, path):
+            self.fp = open(path, "rb")
+            self.size = os.path.getsize(path)
+            self.read_bytes = 0
 
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        def read(self, n=-1):
+            data = self.fp.read(n)
+            if data:
+                self.read_bytes += len(data)
+                if callback:
+                    callback(self.read_bytes, self.size)
+            return data
 
-    current = 0
-    chunk_size = 1024 * 1024  # 1 MB
-    last_update = {status.id: (0, 0)}
+        def __enter__(self):
+            return self
 
-    with open(file_path, "wb") as f:
-        for chunk in client.stream_file(file.file_id, chunk_size=chunk_size):
-            f.write(chunk)
-            current += len(chunk)
-            await edit_progress(status, "Downloading", current, total, last_update)
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self.fp.close()
 
-    # Final update
-    await edit_progress(status, "Downloading", total, total, last_update)
-    return file_path
+    def progress_callback(current, total):
+        # call async coroutine from sync thread
+        loop = asyncio.get_event_loop()
+        asyncio.run_coroutine_threadsafe(
+            edit_progress(status_message, "Uploading", current, total, progress_data),
+            loop
+        )
 
+    # Use the ProgressFile to read in chunks
+    with ProgressFile(file_path) as f:
+        return upload_to_abyss(file_path, api_key, progress_callback=progress_callback)
+
+# ----------------------
+# Handler
+# ----------------------
 @bot.on_message(filters.video | filters.document)
 async def handle_file(client, message: Message):
     file = message.video or message.document
     if not file:
         return
 
-    status = await message.reply_text(f"Downloading {file.file_name}... 0%")
-    try:
-        # Download file manually in chunks
-        file_path = await download_file(client, file, status)
+    # Reply to the video/document
+    status = await message.reply_text(f"Downloading {file.file_name}... 0%", quote=True)
+    file_path = None
 
-        # Upload using executor to avoid blocking
-        await status.edit_text(f"Uploading {file.file_name}... 0%")
+    try:
+        # Download with default Pyrogram progress
+        progress_data[status.id] = (0, 0)
+        file_path = await message.download(
+            file_name=f"./downloads/{file.file_name}",
+            progress=lambda c, t: asyncio.create_task(
+                edit_progress(status, "Downloading", c, t, progress_data)
+            )
+        )
+
+        # Upload with live progress
+        progress_data[status.id] = (0, 0)
+        await status.edit_text(f"Uploading {file.file_name}... 0%", quote=True)
         loop = asyncio.get_event_loop()
         start_time = time.time()
-        slug = await loop.run_in_executor(upload_executor, upload_to_abyss, file_path, ABYSS_API)
+
+        slug = await loop.run_in_executor(
+            upload_executor,
+            upload_with_progress,
+            file_path,
+            ABYSS_API
+        )
+
         elapsed = time.time() - start_time
         size = os.path.getsize(file_path)
         speed = size / elapsed if elapsed > 0 else 0
@@ -109,16 +142,17 @@ async def handle_file(client, message: Message):
         final_url = f"https://zplayer.io/?v={slug}"
         await status.edit_text(
             f"✅ Uploaded!\n{final_url}\n"
-            f"Upload Speed: {human_readable(speed)}/s\n"
-            f"Time: {int(elapsed)}s"
+            f"Avg Upload Speed: {human_readable(speed)}/s\n"
+            f"Time: {int(elapsed)}s",
+            quote=True
         )
+
     except Exception as e:
-        await status.edit_text(f"❌ Failed: {e}")
+        await status.edit_text(f"❌ Failed: {e}", quote=True)
     finally:
-        if os.path.exists(file_path):
+        if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
 if __name__ == "__main__":
-    if not os.path.exists("./downloads"):
-        os.makedirs("./downloads")
+    os.makedirs("./downloads", exist_ok=True)
     bot.run()
