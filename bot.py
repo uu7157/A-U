@@ -28,41 +28,45 @@ def human_readable(size):
         size /= 1024
 
 
-async def update_download_progress(message: Message, file_path: str):
-    """Periodically update download progress until file is fully downloaded."""
-    total = None
+async def track_download_progress(file_path: str, status: Message, total_size: int):
+    """Background task: periodically checks file size and updates progress."""
     last_size = 0
-    while True:
-        if not os.path.exists(file_path):
-            await asyncio.sleep(0.5)
-            continue
-        current = os.path.getsize(file_path)
-        if total is None:
-            total = getattr(message.video or message.document, "file_size", None) or 0
+    start_time = time.time()
 
-        speed = (current - last_size) / 1 if last_size else 0
-        eta = (total - current) / speed if speed > 0 else "-"
-        percent = int(current * 100 / total) if total else 0
-        speed_str = human_readable(speed) + "/s"
-        eta_str = f"{int(eta)}s" if eta != "-" else "-"
+    while not os.path.exists(file_path):
+        await asyncio.sleep(0.5)
+
+    while True:
+        try:
+            current = os.path.getsize(file_path)
+        except Exception as e:
+            print("Error reading file size:", e)
+            current = last_size
+
+        diff = current - last_size
+        last_size = current
+
+        elapsed = time.time() - start_time
+        speed = current / elapsed if elapsed > 0 else 0
+        percent = int(current * 100 / total_size) if total_size else 0
+        eta = (total_size - current) / speed if speed > 0 else "-"
 
         try:
-            await message.edit_text(
+            await status.edit_text(
                 f"Downloading {os.path.basename(file_path)}: {percent}%\n"
-                f"Speed: {speed_str}\n"
-                f"ETA: {eta_str}"
+                f"Speed: {human_readable(speed)}/s\n"
+                f"ETA: {int(eta) if eta != '-' else '-'}s"
             )
-        except:
-            pass
+        except Exception as e:
+            print("Error editing status message:", e)
 
-        if total and current >= total:
+        if total_size and current >= total_size:
             break
-        last_size = current
-        await asyncio.sleep(1)  # update every 1 second
+        await asyncio.sleep(1)
 
 
 def upload_file(file_path: str):
-    """Upload the file using your existing uploader.py and measure speed."""
+    """Upload using uploader.py, measure time and speed."""
     start_time = time.time()
     slug = upload_to_abyss(file_path, ABYSS_API)
     elapsed = time.time() - start_time
@@ -80,22 +84,25 @@ async def handle_file(client, message: Message):
     if not file:
         return
 
-    # Ensure download directory exists
     os.makedirs("./downloads", exist_ok=True)
     file_path = f"./downloads/{file.file_name}"
 
     # Reply to file
-    status = await message.reply_text(f"Downloading {file.file_name}... 0%", quote=True)
+    status = await message.reply_text(f"Starting download {file.file_name}...", quote=True)
 
     try:
-        # Start download in background
-        download_task = asyncio.create_task(update_download_progress(status, file_path))
+        # Start background task to track progress
+        total_size = getattr(file, "file_size", 0)
+        progress_task = asyncio.create_task(track_download_progress(file_path, status, total_size))
+
+        # Download file fully
         file_path = await message.download(file_name=file_path)
-        await download_task  # wait for final progress update
+
+        # Ensure final progress is shown
+        await progress_task
 
         # Upload
         await status.edit_text(f"Uploading {file.file_name}...")
-
         loop = asyncio.get_event_loop()
         slug, elapsed, speed = await loop.run_in_executor(upload_executor, upload_file, file_path)
 
@@ -107,6 +114,8 @@ async def handle_file(client, message: Message):
         )
 
     except Exception as e:
+        # Log exception to Colab console
+        print("Error handling file:", e)
         await status.edit_text(f"❌ Failed: {e}")
 
     finally:
