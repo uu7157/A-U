@@ -1,7 +1,7 @@
 import os
 import requests
 
-def upload_to_hydrax(file_path: str, api_key: str, progress_callback=None):
+def upload_to_abyss(file_path: str, api_key: str, progress_callback=None):
     url = f"http://up.hydrax.net/{api_key}"
 
     with open(file_path, "rb") as f:
