@@ -6,9 +6,12 @@ from pyrogram.session import Session, Auth
 from pyrogram.errors import AuthBytesInvalid
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 
+# Telegram GetFile max chunk limit = 512 KB
+TG_MAX_CHUNK = 512 * 1024  # 524288 bytes
+
 
 async def chunk_size(length: int) -> int:
-    """Calculate optimal chunk size for downloading."""
+    """Calculate optimal chunk size for downloading (but clamp later)."""
     return 2 ** max(min(math.ceil(math.log2(length / 1024)), 10), 2) * 1024
 
 
@@ -142,16 +145,22 @@ class TGCustomYield:
         current_part = 1
         location = await self.get_location(data)
 
-        r = await media_session.send(raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size))
+        # Clamp chunk_size to Telegram max
+        chunk_size = min(chunk_size, TG_MAX_CHUNK)
+
+        r = await media_session.send(raw.functions.upload.GetFile(
+            location=location, offset=offset, limit=chunk_size
+        ))
         if not isinstance(r, raw.types.upload.File):
-            return  # nothing to yield
+            return
 
         while current_part <= part_count:
             chunk = getattr(r, "bytes", None)
             if not chunk:
                 break
 
-            offset += chunk_size
+            offset += len(chunk)  # safe increment
+
             if part_count == 1:
                 yield chunk[first_part_cut:last_part_cut]
                 break
@@ -160,7 +169,9 @@ class TGCustomYield:
             elif 1 < current_part <= part_count:
                 yield chunk
 
-            r = await media_session.send(raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size))
+            r = await media_session.send(raw.functions.upload.GetFile(
+                location=location, offset=offset, limit=chunk_size
+            ))
             if not isinstance(r, raw.types.upload.File):
                 break
 
@@ -173,7 +184,7 @@ class TGCustomYield:
         media_session = await self.generate_media_session(client, media_msg)
         location = await self.get_location(data)
 
-        limit = 1024 * 1024
+        limit = TG_MAX_CHUNK  # enforce max
         offset = 0
 
         r = await media_session.send(raw.functions.upload.GetFile(location=location, offset=offset, limit=limit))
@@ -186,7 +197,7 @@ class TGCustomYield:
             if not chunk:
                 break
             m_file.append(chunk)
-            offset += limit
+            offset += len(chunk)
             r = await media_session.send(raw.functions.upload.GetFile(location=location, offset=offset, limit=limit))
             if not isinstance(r, raw.types.upload.File):
                 break
