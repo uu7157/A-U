@@ -6,7 +6,7 @@ from pyrogram.types import Message
 from concurrent.futures import ThreadPoolExecutor
 
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
-from uploader import upload_to_abyss  # use your existing uploader.py
+from uploader import upload_to_abyss  # your existing uploader.py
 
 bot = Client(
     "abyss-bot",
@@ -16,7 +16,8 @@ bot = Client(
 )
 
 upload_executor = ThreadPoolExecutor(max_workers=3)
-progress_data = {}  # track progress per message
+progress_data = {}  # store last update per message for speed/ETA
+
 
 # ----------------------
 # Utilities
@@ -26,6 +27,7 @@ def human_readable(size):
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
+
 
 async def edit_progress(message: Message, tag: str, current, total, last_update):
     now = time.time()
@@ -58,44 +60,38 @@ async def edit_progress(message: Message, tag: str, current, total, last_update)
 
     last_update[message.id] = (now, current)
 
+
 # ----------------------
-# Wrapper for upload with progress
+# Safe download progress callback
 # ----------------------
-def upload_with_progress(file_path, api_key, progress_callback=None):
-    """
-    Calls the existing uploader.py function and updates progress manually.
-    """
-    # Wrap the file to report read bytes
-    class ProgressFile:
-        def __init__(self, path):
-            self.fp = open(path, "rb")
-            self.size = os.path.getsize(path)
-            self.read_bytes = 0
-
-        def read(self, n=-1):
-            data = self.fp.read(n)
-            if data:
-                self.read_bytes += len(data)
-                if progress_callback:
-                    progress_callback(self.read_bytes, self.size)
-            return data
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc_val, exc_tb):
-            self.fp.close()
-
-    # Use ProgressFile but call uploader.py normally
-    def progress_report(current, total):
-        # call async coroutine from sync thread
-        loop = asyncio.get_event_loop()
+def safe_progress_callback(message, current, total):
+    try:
+        loop = asyncio.get_running_loop()
         asyncio.run_coroutine_threadsafe(
-            edit_progress(status_message, "Uploading", current, total, progress_data),
+            edit_progress(message, "Downloading", current, total, progress_data),
             loop
         )
+    except RuntimeError:
+        # ignore if no running loop in thread
+        pass
 
-    return upload_to_abyss(file_path, api_key, progress_callback=progress_report)
+
+# ----------------------
+# Wrapper for upload (runs in executor)
+# ----------------------
+def upload_file(file_path, status_message):
+    start_time = time.time()
+
+    def upload_callback(current, total):
+        # We can't safely do live updates from this thread due to asyncio limits
+        pass
+
+    slug = upload_to_abyss(file_path, ABYSS_API, progress_callback=upload_callback)
+    elapsed = time.time() - start_time
+    size = os.path.getsize(file_path)
+    speed = size / elapsed if elapsed > 0 else 0
+    return slug, elapsed, speed
+
 
 # ----------------------
 # Handler
@@ -106,42 +102,26 @@ async def handle_file(client, message: Message):
     if not file:
         return
 
-    # Reply to the video/document
+    # Reply to this file
     status = await message.reply_text(f"Downloading {file.file_name}... 0%", quote=True)
     file_path = None
 
     try:
-        # Download with Pyrogram default progress
         progress_data[status.id] = (0, 0)
+        # Download file safely without crashing on threads
         file_path = await message.download(
             file_name=f"./downloads/{file.file_name}",
-            progress=lambda c, t: asyncio.run_coroutine_threadsafe(
-                edit_progress(status, "Downloading", c, t, progress_data),
-                asyncio.get_event_loop()
-            )
+            progress=lambda c, t: safe_progress_callback(status, c, t)
         )
 
-        # Upload with live progress
-        progress_data[status.id] = (0, 0)
-        await status.edit_text(f"Uploading {file.file_name}... 0%")
+        # Upload starts after full download
+        await status.edit_text(f"Uploading {file.file_name}...")
+
         loop = asyncio.get_event_loop()
-        start_time = time.time()
-
-        # Set status_message for progress callback
-        global status_message
-        status_message = status
-
-        # Run upload in thread executor
-        slug = await loop.run_in_executor(
-            upload_executor,
-            upload_with_progress,
-            file_path,
-            ABYSS_API
+        # Run upload in executor
+        slug, elapsed, speed = await loop.run_in_executor(
+            upload_executor, upload_file, file_path, status
         )
-
-        elapsed = time.time() - start_time
-        size = os.path.getsize(file_path)
-        speed = size / elapsed if elapsed > 0 else 0
 
         final_url = f"https://zplayer.io/?v={slug}"
         await status.edit_text(
@@ -155,6 +135,7 @@ async def handle_file(client, message: Message):
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
+
 
 # ----------------------
 # Run
