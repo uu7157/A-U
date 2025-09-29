@@ -1,11 +1,12 @@
 import os
 import time
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from concurrent.futures import ThreadPoolExecutor
+import requests
 
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
-from uploader import upload_to_abyss
-
 
 bot = Client(
     "abyss-bot",
@@ -14,25 +15,29 @@ bot = Client(
     bot_token=BOT_TOKEN,
 )
 
+# Executor for blocking uploads
+upload_executor = ThreadPoolExecutor(max_workers=3)  # Adjust as needed
 
-# Store last update info per message
+# Store per-message progress info
 progress_data = {}
 
-
+# ----------------------
+# Utility functions
+# ----------------------
 def human_readable(size):
-    """Convert bytes to human readable MB/GB"""
+    """Convert bytes to human readable format"""
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
 
 
-async def update_progress(current, total, message: Message, tag: str):
+async def edit_progress(message: Message, tag: str, current, total, last_update):
     now = time.time()
-    last_time, last_bytes = progress_data.get(message.id, (0, 0))
+    last_time, last_bytes = last_update.get(message.id, (0, 0))
 
-    # update only every 3s or when finished
-    if now - last_time < 3 and current != total:
+    # Update every 2s or on completion
+    if now - last_time < 2 and current != total:
         return
 
     speed = 0
@@ -58,44 +63,67 @@ async def update_progress(current, total, message: Message, tag: str):
     except:
         pass
 
-    progress_data[message.id] = (now, current)
+    last_update[message.id] = (now, current)
 
 
+# ----------------------
+# Upload function
+# ----------------------
+def upload_to_abyss(file_path: str, api_key: str):
+    """Blocking upload function"""
+    url = f"http://up.hydrax.net/{api_key}"
+    with open(file_path, "rb") as f:
+        files = {"file": (os.path.basename(file_path), f, "video/mp4")}
+        response = requests.post(url, files=files)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("url") or data.get("slug")
+
+
+# ----------------------
+# Handler
+# ----------------------
 @bot.on_message(filters.video | filters.document)
-async def handle_video(client, message: Message):
+async def handle_file(client, message: Message):
     file = message.video or message.document
     if not file:
         return
 
-    status = await message.reply_text("Downloading... 0%")
+    # Reply to this specific file
+    status = await message.reply_text(f"Downloading {file.file_name}... 0%")
 
-    # Reset progress tracking
+    # Initialize progress tracking for this message
     progress_data[status.id] = (0, 0)
 
-    # Download with progress
-    file_path = await message.download(
-        progress=lambda c, t: bot.loop.create_task(
-            update_progress(c, t, status, "Downloading")
-        )
+    # ----------------------
+    # Download with larger chunk size
+    # ----------------------
+    file_path = await client.download_media(
+        file,
+        file_name=f"./downloads/{file.file_name}",
+        progress=lambda current, total: asyncio.create_task(
+            edit_progress(status, "Downloading", current, total, progress_data)
+        ),
+        chunk_size=1024 * 1024  # 1 MB chunks → faster
     )
 
-    # Upload part
+    # ----------------------
+    # Upload in executor to avoid blocking
+    # ----------------------
+    progress_data[status.id] = (0, 0)
+    await status.edit_text(f"Uploading {file.file_name}... 0%")
+
+    loop = asyncio.get_event_loop()
+    start_time = time.time()
     try:
-        progress_data[status.id] = (0, 0)
-        await status.edit_text("Uploading... 0%")
-
-        # since upload_to_abyss is sync, we can’t hook chunk-speed easily,
-        # but we simulate progress before/after request
-        start = time.time()
-        slug = upload_to_abyss(file_path, ABYSS_API)
-        elapsed = time.time() - start
-
-        final_url = f"https://zplayer.io/?v={slug}"
+        slug = await loop.run_in_executor(upload_executor, upload_to_abyss, file_path, ABYSS_API)
+        elapsed = time.time() - start_time
         size = os.path.getsize(file_path)
         speed = size / elapsed if elapsed > 0 else 0
 
+        final_url = f"https://zplayer.io/?v={slug}"
         await status.edit_text(
-            f"✅ Uploaded!\n{final_url}\n\n"
+            f"✅ Uploaded!\n{final_url}\n"
             f"Upload Speed: {human_readable(speed)}/s\n"
             f"Time: {int(elapsed)}s"
         )
@@ -107,4 +135,7 @@ async def handle_video(client, message: Message):
 
 
 if __name__ == "__main__":
+    # Create downloads folder if missing
+    if not os.path.exists("./downloads"):
+        os.makedirs("./downloads")
     bot.run()
