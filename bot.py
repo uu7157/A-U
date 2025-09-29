@@ -1,159 +1,122 @@
-import asyncio
-import time
 import os
-import sys
-import math
-import logging
+import time
+import asyncio
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from concurrent.futures import ThreadPoolExecutor
-
-from uploader import upload_to_abyss
-from custom_dl import TGCustomYield
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
+from uploader import upload_to_abyss  # your existing uploader.py
 
-# Logging for Colab (errors / debug)
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+bot = Client(
+    "abyss-bot",
+    api_id=APP_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+)
 
-bot = Client("abyss-bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 upload_executor = ThreadPoolExecutor(max_workers=3)
-
-os.makedirs("./downloads", exist_ok=True)
 
 # ----------------------
 # Utilities
 # ----------------------
-def human_readable(size: float) -> str:
+def human_readable(size):
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
-    return f"{size:.2f} PB"
 
-
-async def safe_edit(message: Message, text: str):
+def safe_asyncio_task(coro):
+    """Schedule an async coroutine safely from a thread."""
     try:
-        await message.edit_text(text)
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.get_event_loop()
+    return asyncio.run_coroutine_threadsafe(coro, loop)
+
+async def edit_download_progress(message: Message, tag: str, current: int, total: int, start_time: float, last_update: dict):
+    """Edit message with download progress, speed, ETA."""
+    now = time.time()
+    last_time, last_bytes = last_update.get(message.id, (start_time, 0))
+    if now - last_time < 1 and current != total:
+        return
+    diff_bytes = current - last_bytes
+    diff_time = now - last_time
+    speed = diff_bytes / diff_time if diff_time > 0 else 0
+    eta = (total - current) / speed if speed > 0 else "-"
+    percent = int(current * 100 / total) if total else 0
+    try:
+        await message.edit_text(
+            f"{tag}: {percent}%\n"
+            f"Downloaded: {human_readable(current)} / {human_readable(total)}\n"
+            f"Speed: {human_readable(speed)}/s\n"
+            f"ETA: {int(eta) if eta != '-' else '-'}s"
+        )
     except Exception as e:
-        # ignore edit failures (message deleted, flood, etc.)
-        logger.debug("safe_edit failed: %s", e)
-
+        print("Failed to edit download progress:", e)
+    last_update[message.id] = (now, current)
 
 # ----------------------
-# Download & upload handler
+# Upload function
 # ----------------------
-TG_CHUNK_SIZE = 512 * 1024  # 512 KB (Telegram GetFile limit)
-UPDATE_INTERVAL = 5  # seconds between Telegram edits
+def upload_file(file_path: str):
+    start_time = time.time()
+    slug = upload_to_abyss(file_path, ABYSS_API)
+    elapsed = time.time() - start_time
+    size = os.path.getsize(file_path)
+    speed = size / elapsed if elapsed > 0 else 0
+    return slug, elapsed, speed
 
-async def handle_file(message: Message):
+# ----------------------
+# Handler
+# ----------------------
+@bot.on_message(filters.video | filters.document)
+async def handle_file(client, message: Message):
     file = message.video or message.document
     if not file:
         return
 
-    status = await message.reply_text(f"Preparing {file.file_name}...", quote=True)
-    local_path = f"./downloads/{file.file_name}"
+    os.makedirs("./downloads", exist_ok=True)
+    file_path = f"./downloads/{file.file_name}"
+    status = await message.reply_text(f"Starting download {file.file_name}...", quote=True)
+
+    last_update = {}
     start_time = time.time()
 
     try:
-        downloader = TGCustomYield(bot)
+        # ------------------
+        # Download with live progress
+        # ------------------
+        async def progress_callback(current, total):
+            await edit_download_progress(status, "Downloading", current, total, start_time, last_update)
 
-        total_size = getattr(file, "file_size", 0) or 0
-        downloaded = 0
+        file_path = await message.download(file_name=file_path, progress=progress_callback)
 
-        # choose chunk size (clamped to TG limit)
-        chunk_size = TG_CHUNK_SIZE
+        await status.edit_text(f"✅ Downloaded {file.file_name} ({human_readable(os.path.getsize(file_path))})")
 
-        # compute number of parts; if total_size unknown, use a large fallback
-        if total_size > 0:
-            part_count = math.ceil(total_size / chunk_size)
-        else:
-            part_count = 10**9  # fallback - will stop when Telegram returns no more data
-
-        logger.info("Starting download: %s size=%s chunk=%s parts=%s",
-                    file.file_name, total_size, chunk_size, part_count)
-
-        last_update = 0
-
-        # Download file using TG DC in multiple parts
-        with open(local_path, "wb") as f:
-            async for chunk in downloader.yield_file(
-                media_msg=message,
-                offset=0,
-                first_part_cut=0,
-                last_part_cut=0,
-                part_count=part_count,
-                chunk_size=chunk_size
-            ):
-                if not chunk:
-                    # if yield_file returns None/empty chunk, stop
-                    logger.warning("Received empty chunk while downloading %s", file.file_name)
-                    break
-
-                f.write(chunk)
-                downloaded += len(chunk)
-
-                now = time.time()
-                # update Telegram every UPDATE_INTERVAL seconds, or when download finished
-                if now - last_update >= UPDATE_INTERVAL or (total_size and downloaded >= total_size):
-                    percent = int(downloaded * 100 / total_size) if total_size else 0
-                    elapsed = now - start_time if now - start_time > 0 else 0.0001
-                    speed = human_readable(downloaded / elapsed)
-                    eta = int((total_size - downloaded) / (downloaded / elapsed)) if (total_size and downloaded) else "-"
-                    await safe_edit(
-                        status,
-                        f"⬇️ Downloading {file.file_name}: {percent}%\n"
-                        f"Speed: {speed}/s\nETA: {eta}s"
-                    )
-                    last_update = now
-
-        # verify file exists and has data
-        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
-            raise RuntimeError("Download failed or file is empty")
-
-        await safe_edit(status, f"✅ Download complete! Uploading to Abyss...")
-
-        # Upload using existing uploader in thread pool (synchronous)
+        # ------------------
+        # Upload
+        # ------------------
+        await status.edit_text(f"Uploading {file.file_name}...")
         loop = asyncio.get_event_loop()
+        slug, elapsed, speed = await loop.run_in_executor(upload_executor, upload_file, file_path)
 
-        def upload_task():
-            try:
-                return upload_to_abyss(local_path, api_key=ABYSS_API)
-            except Exception as ex:
-                # re-raise to be caught by outer except
-                raise
-
-        slug = await loop.run_in_executor(upload_executor, upload_task)
-
-        elapsed_total = time.time() - start_time
-        size = os.path.getsize(local_path)
-        avg_speed = human_readable(size / elapsed_total) if elapsed_total else "0 B"
-
-        await safe_edit(
-            status,
-            f"✅ Uploaded!\nhttps://zplayer.io/?v={slug}\n"
-            f"Avg Upload Speed: {avg_speed}/s\n"
-            f"Total Time: {int(elapsed_total)}s"
+        final_url = f"https://zplayer.io/?v={slug}"
+        await status.edit_text(
+            f"✅ Uploaded!\n{final_url}\n"
+            f"Avg Upload Speed: {human_readable(speed)}/s\n"
+            f"Time: {int(elapsed)}s"
         )
 
     except Exception as e:
-        # print full traceback to Colab logs for debugging
-        logger.exception("Error handling file")
-        await safe_edit(status, f"❌ Failed: {e}")
+        print("Error handling file:", e)
+        await status.edit_text(f"❌ Failed: {e}")
 
     finally:
-        try:
-            if os.path.exists(local_path):
-                os.remove(local_path)
-        except Exception:
-            logger.exception("Failed to remove local file")
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-
-@bot.on_message(filters.video | filters.document)
-async def handle_message(client, message: Message):
-    # run each file as a background task so multiple files can be processed concurrently
-    asyncio.create_task(handle_file(message))
-
-
+# ----------------------
+# Run
+# ----------------------
 if __name__ == "__main__":
     bot.run()
