@@ -4,13 +4,14 @@ import sys
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from concurrent.futures import ThreadPoolExecutor
-from uploader import upload_to_abyss  # your uploader.py
-from custom_dl import TGCustomYield  # raw DC downloader
+from uploader import upload_to_abyss  # your existing uploader.py
+from custom_dl import TGCustomYield  # Telegram DC streaming
 
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
 
 bot = Client("abyss-bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 upload_executor = ThreadPoolExecutor(max_workers=3)
+
 
 # ----------------------
 # Utilities
@@ -43,78 +44,95 @@ async def stream_telegram_to_abyss(message: Message):
         downloader = TGCustomYield()
         downloader.main_bot = bot
 
-        # total size
         total_size = getattr(file, "file_size", 0)
-        downloaded = 0
-        uploaded = 0
+        downloaded_bytes = 0
         start_time = time.time()
 
-        # Generator yielding chunks
+        # ----------------------
+        # Async generator for Telegram chunks
+        # ----------------------
         async def chunk_generator():
-            nonlocal downloaded
+            nonlocal downloaded_bytes
             async for chunk in downloader.yield_file(
                 media_msg=message,
                 offset=0,
                 first_part_cut=0,
                 last_part_cut=0,
                 part_count=1,
-                chunk_size=4 * 1024 * 1024  # 4 MB chunks
+                chunk_size=4 * 1024 * 1024,  # 4MB chunks
             ):
-                downloaded += len(chunk)
-                percent = int(downloaded * 100 / total_size) if total_size else 0
-                speed = human_readable(downloaded / (time.time() - start_time))
-                eta = int((total_size - downloaded) / (downloaded / (time.time() - start_time))) if downloaded else "-"
+                downloaded_bytes += len(chunk)
+                elapsed = time.time() - start_time
+                percent = int(downloaded_bytes * 100 / total_size) if total_size else 0
+                speed = human_readable(downloaded_bytes / elapsed) if elapsed > 0 else "0 B"
+                eta = int((total_size - downloaded_bytes) / (downloaded_bytes / elapsed)) if downloaded_bytes else "-"
                 await safe_edit(
                     status,
-                    f"Downloading {file.file_name}: {percent}%\n"
-                    f"Speed: {speed}/s\nETA: {eta}s"
+                    f"Downloading {file.file_name}: {percent}%\nSpeed: {speed}/s\nETA: {eta}s"
                 )
                 yield chunk
 
-        # Wrapper for streaming upload to Abyss
-        def upload_wrapper():
-            nonlocal uploaded
-            class IterableWrapper:
-                def __init__(self, gen):
-                    self.gen = gen
-                    self.bytes_uploaded = 0
+        # ----------------------
+        # Streaming wrapper for uploader.py
+        # ----------------------
+        class StreamFile:
+            def __init__(self, async_gen):
+                self.async_gen = async_gen.__aiter__()
+                self.buffer = b""
 
-                def __iter__(self):
-                    for chunk in asyncio.run(self.gen.__aiter__()):
-                        self.bytes_uploaded += len(chunk)
-                        uploaded = self.bytes_uploaded
-                        yield chunk
-
-            # Call existing uploader.py with streaming wrapper
-            # For compatibility, we write a temporary generator-based file-like object
-            class StreamFile:
-                def __init__(self, gen):
-                    self.gen = gen
-
-                def read(self, n=-1):
+            def read(self, n=-1):
+                import asyncio
+                loop = asyncio.get_event_loop()
+                while n == -1 or len(self.buffer) < n:
                     try:
-                        return next(self.gen)
-                    except StopIteration:
-                        return b""
+                        chunk = loop.run_until_complete(self.async_gen.__anext__())
+                        self.buffer += chunk
+                    except StopAsyncIteration:
+                        break
+                if n == -1:
+                    data, self.buffer = self.buffer, b""
+                else:
+                    data, self.buffer = self.buffer[:n], self.buffer[n:]
+                return data
 
-            wrapper = IterableWrapper(chunk_generator())
-            return upload_to_abyss(file_path=None, api_key=ABYSS_API, progress_callback=None)  # uploader should accept streaming wrapper
+        # Progress callback for upload
+        def progress_callback(current, total):
+            percent = int(current * 100 / total) if total else 0
+            asyncio.run_coroutine_threadsafe(
+                safe_edit(status, f"Uploading {file.file_name}: {percent}%"),
+                asyncio.get_event_loop()
+            )
 
+        # ----------------------
+        # Run upload in ThreadPoolExecutor
+        # ----------------------
         loop = asyncio.get_event_loop()
-        slug = await loop.run_in_executor(upload_executor, upload_wrapper)
+        slug = await loop.run_in_executor(
+            upload_executor,
+            lambda: upload_to_abyss(StreamFile(chunk_generator()), ABYSS_API, progress_callback)
+        )
 
         elapsed = time.time() - start_time
-        await safe_edit(status, f"✅ Uploaded!\nhttps://zplayer.io/?v={slug}\nTime: {int(elapsed)}s")
+        await safe_edit(
+            status,
+            f"✅ Uploaded!\nhttps://zplayer.io/?v={slug}\nTime: {int(elapsed)}s"
+        )
 
     except Exception as e:
         print("Error streaming file:", e, file=sys.stderr)
         await safe_edit(status, f"❌ Failed: {e}")
 
 
+# ----------------------
+# Message handler
+# ----------------------
 @bot.on_message(filters.video | filters.document)
 async def handle_message(client, message: Message):
     asyncio.create_task(stream_telegram_to_abyss(message))
 
 
+# ----------------------
+# Run bot
+# ----------------------
 if __name__ == "__main__":
     bot.run()
