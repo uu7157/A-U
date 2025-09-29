@@ -2,7 +2,7 @@ import os
 import requests
 
 def upload_to_abyss(file_path: str, api_key: str, progress_callback=None):
-    url = f"http://up.abyss.to/{api_key}"
+    url = f"https://up.hydrax.net/{api_key}"
 
     with open(file_path, "rb") as f:
         # stream upload
