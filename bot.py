@@ -28,45 +28,36 @@ def human_readable(size):
         size /= 1024
 
 
-async def track_download_progress(file_path: str, status: Message, total_size: int):
-    """Background task: periodically checks file size and updates progress."""
-    last_size = 0
-    start_time = time.time()
-
-    while not os.path.exists(file_path):
-        await asyncio.sleep(0.5)
-
-    while True:
-        try:
-            current = os.path.getsize(file_path)
-        except Exception as e:
-            print("Error reading file size:", e)
-            current = last_size
-
-        diff = current - last_size
-        last_size = current
-
-        elapsed = time.time() - start_time
-        speed = current / elapsed if elapsed > 0 else 0
-        percent = int(current * 100 / total_size) if total_size else 0
-        eta = (total_size - current) / speed if speed > 0 else "-"
-
-        try:
-            await status.edit_text(
-                f"Downloading {os.path.basename(file_path)}: {percent}%\n"
-                f"Speed: {human_readable(speed)}/s\n"
-                f"ETA: {int(eta) if eta != '-' else '-'}s"
-            )
-        except Exception as e:
-            print("Error editing status message:", e)
-
-        if total_size and current >= total_size:
-            break
-        await asyncio.sleep(1)
+async def edit_progress(message: Message, tag: str, current: int, total: int):
+    """Edit message with progress, speed, and ETA."""
+    percent = int(current * 100 / total) if total else 0
+    speed = human_readable(current / 1)  # rough instant speed (simplified)
+    eta = int((total - current) / (current / 1)) if current > 0 else "-"
+    try:
+        await message.edit_text(
+            f"{tag}: {percent}%\n"
+            f"Downloaded: {human_readable(current)} / {human_readable(total)}\n"
+            f"Speed: {speed}/s\n"
+            f"ETA: {eta}s"
+        )
+    except Exception as e:
+        print("Failed to update progress:", e)
 
 
+def safe_asyncio_task(coro):
+    """Schedule an async coroutine safely from a thread."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop in this thread
+        loop = asyncio.get_event_loop()
+    return asyncio.run_coroutine_threadsafe(coro, loop)
+
+
+# ----------------------
+# Upload function
+# ----------------------
 def upload_file(file_path: str):
-    """Upload using uploader.py, measure time and speed."""
     start_time = time.time()
     slug = upload_to_abyss(file_path, ABYSS_API)
     elapsed = time.time() - start_time
@@ -87,19 +78,22 @@ async def handle_file(client, message: Message):
     os.makedirs("./downloads", exist_ok=True)
     file_path = f"./downloads/{file.file_name}"
 
-    # Reply to file
+    # Reply to the file
     status = await message.reply_text(f"Starting download {file.file_name}...", quote=True)
 
     try:
-        # Start background task to track progress
         total_size = getattr(file, "file_size", 0)
-        progress_task = asyncio.create_task(track_download_progress(file_path, status, total_size))
 
-        # Download file fully
-        file_path = await message.download(file_name=file_path)
+        # Download with Pyrogram progress callback
+        file_path = await message.download(
+            file_name=file_path,
+            progress=lambda current, total: safe_asyncio_task(
+                edit_progress(status, "Downloading", current, total)
+            )
+        )
 
-        # Ensure final progress is shown
-        await progress_task
+        # Ensure final download info
+        await status.edit_text(f"✅ Downloaded {file.file_name} ({human_readable(os.path.getsize(file_path))})")
 
         # Upload
         await status.edit_text(f"Uploading {file.file_name}...")
@@ -114,7 +108,6 @@ async def handle_file(client, message: Message):
         )
 
     except Exception as e:
-        # Log exception to Colab console
         print("Error handling file:", e)
         await status.edit_text(f"❌ Failed: {e}")
 
@@ -124,7 +117,7 @@ async def handle_file(client, message: Message):
 
 
 # ----------------------
-# Run
+# Run the bot
 # ----------------------
 if __name__ == "__main__":
     bot.run()
