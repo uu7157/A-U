@@ -2,17 +2,12 @@ import asyncio
 import time
 import os
 import sys
-import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from concurrent.futures import ThreadPoolExecutor
 from uploader import upload_to_abyss
 from custom_dl import TGCustomYield
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 bot = Client("abyss-bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 upload_executor = ThreadPoolExecutor(max_workers=3)
@@ -27,6 +22,7 @@ def human_readable(size):
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
+    return f"{size:.2f} PB"
 
 
 async def safe_edit(message: Message, text: str):
@@ -39,6 +35,8 @@ async def safe_edit(message: Message, text: str):
 # ----------------------
 # Download & upload handler
 # ----------------------
+MAX_CHUNK_SIZE = 10 * 1024 * 1024  # Telegram limit (10 MB)
+
 async def handle_file(message: Message):
     file = message.video or message.document
     if not file:
@@ -47,17 +45,40 @@ async def handle_file(message: Message):
     status = await message.reply_text(f"Preparing {file.file_name}...", quote=True)
 
     local_path = f"./downloads/{file.file_name}"
-    start_time = time.time()
-
     try:
         downloader = TGCustomYield(bot)
 
-        # ✅ New download method with logging inside custom_dl
-        await safe_edit(status, f"⬇️ Downloading {file.file_name}...")
-        await downloader.download_to_file(message, local_path)
+        total_size = getattr(file, "file_size", 0)
+        downloaded = 0
+        start_time = time.time()
+        last_update = 0  # control telegram update interval
 
-        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
-            raise RuntimeError("Download failed or file is empty")
+        # Download file using TG DC
+        with open(local_path, "wb") as f:
+            async for chunk in downloader.yield_file(
+                media_msg=message,
+                offset=0,
+                first_part_cut=0,
+                last_part_cut=0,
+                part_count=1,
+                chunk_size=min(4 * 1024 * 1024, MAX_CHUNK_SIZE)
+            ):
+                f.write(chunk)
+                downloaded += len(chunk)
+
+                now = time.time()
+                if now - last_update >= 5 or downloaded == total_size:  # update every 5s or at end
+                    percent = int(downloaded * 100 / total_size) if total_size else 0
+                    elapsed = now - start_time
+                    speed = human_readable(downloaded / elapsed) if elapsed else "0 B"
+                    eta = int((total_size - downloaded) / (downloaded / elapsed)) if downloaded else "-"
+
+                    await safe_edit(
+                        status,
+                        f"⬇️ Downloading {file.file_name}: {percent}%\n"
+                        f"Speed: {speed}/s\nETA: {eta}s"
+                    )
+                    last_update = now
 
         await safe_edit(status, f"✅ Download complete! Uploading to Abyss...")
 
@@ -81,15 +102,13 @@ async def handle_file(message: Message):
         )
 
     except Exception as e:
-        logger.exception("Error handling file")
+        # Only log errors in Colab / console
+        print("Error handling file:", e, file=sys.stderr)
         await safe_edit(status, f"❌ Failed: {e}")
 
     finally:
         if os.path.exists(local_path):
-            try:
-                os.remove(local_path)
-            except Exception:
-                pass
+            os.remove(local_path)
 
 
 @bot.on_message(filters.video | filters.document)
