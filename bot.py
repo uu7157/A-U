@@ -16,7 +16,6 @@ bot = Client(
 )
 
 upload_executor = ThreadPoolExecutor(max_workers=3)
-progress_data = {}  # store last update per message for speed/ETA
 
 
 # ----------------------
@@ -29,64 +28,43 @@ def human_readable(size):
         size /= 1024
 
 
-async def edit_progress(message: Message, tag: str, current, total, last_update):
-    now = time.time()
-    last_time, last_bytes = last_update.get(message.id, (0, 0))
-    if now - last_time < 2 and current != total:
-        return
+async def update_download_progress(message: Message, file_path: str):
+    """Periodically update download progress until file is fully downloaded."""
+    total = None
+    last_size = 0
+    while True:
+        if not os.path.exists(file_path):
+            await asyncio.sleep(0.5)
+            continue
+        current = os.path.getsize(file_path)
+        if total is None:
+            total = getattr(message.video or message.document, "file_size", None) or 0
 
-    speed = 0
-    eta = 0
-    if last_time > 0:
-        diff_bytes = current - last_bytes
-        diff_time = now - last_time
-        if diff_time > 0:
-            speed = diff_bytes / diff_time
-            if speed > 0:
-                eta = (total - current) / speed
+        speed = (current - last_size) / 1 if last_size else 0
+        eta = (total - current) / speed if speed > 0 else "-"
+        percent = int(current * 100 / total) if total else 0
+        speed_str = human_readable(speed) + "/s"
+        eta_str = f"{int(eta)}s" if eta != "-" else "-"
 
-    percent = int(current * 100 / total)
-    speed_str = f"{human_readable(speed)}/s" if speed else "0 B/s"
-    eta_str = f"{int(eta)}s" if eta else "-"
+        try:
+            await message.edit_text(
+                f"Downloading {os.path.basename(file_path)}: {percent}%\n"
+                f"Speed: {speed_str}\n"
+                f"ETA: {eta_str}"
+            )
+        except:
+            pass
 
-    try:
-        await message.edit_text(
-            f"{tag}: {percent}%\n"
-            f"Speed: {speed_str}\n"
-            f"ETA: {eta_str}"
-        )
-    except:
-        pass
-
-    last_update[message.id] = (now, current)
-
-
-# ----------------------
-# Safe download progress callback
-# ----------------------
-def safe_progress_callback(message, current, total):
-    try:
-        loop = asyncio.get_running_loop()
-        asyncio.run_coroutine_threadsafe(
-            edit_progress(message, "Downloading", current, total, progress_data),
-            loop
-        )
-    except RuntimeError:
-        # ignore if no running loop in thread
-        pass
+        if total and current >= total:
+            break
+        last_size = current
+        await asyncio.sleep(1)  # update every 1 second
 
 
-# ----------------------
-# Wrapper for upload (runs in executor)
-# ----------------------
-def upload_file(file_path, status_message):
+def upload_file(file_path: str):
+    """Upload the file using your existing uploader.py and measure speed."""
     start_time = time.time()
-
-    def upload_callback(current, total):
-        # We can't safely do live updates from this thread due to asyncio limits
-        pass
-
-    slug = upload_to_abyss(file_path, ABYSS_API, progress_callback=upload_callback)
+    slug = upload_to_abyss(file_path, ABYSS_API)
     elapsed = time.time() - start_time
     size = os.path.getsize(file_path)
     speed = size / elapsed if elapsed > 0 else 0
@@ -102,26 +80,24 @@ async def handle_file(client, message: Message):
     if not file:
         return
 
-    # Reply to this file
+    # Ensure download directory exists
+    os.makedirs("./downloads", exist_ok=True)
+    file_path = f"./downloads/{file.file_name}"
+
+    # Reply to file
     status = await message.reply_text(f"Downloading {file.file_name}... 0%", quote=True)
-    file_path = None
 
     try:
-        progress_data[status.id] = (0, 0)
-        # Download file safely without crashing on threads
-        file_path = await message.download(
-            file_name=f"./downloads/{file.file_name}",
-            progress=lambda c, t: safe_progress_callback(status, c, t)
-        )
+        # Start download in background
+        download_task = asyncio.create_task(update_download_progress(status, file_path))
+        file_path = await message.download(file_name=file_path)
+        await download_task  # wait for final progress update
 
-        # Upload starts after full download
+        # Upload
         await status.edit_text(f"Uploading {file.file_name}...")
 
         loop = asyncio.get_event_loop()
-        # Run upload in executor
-        slug, elapsed, speed = await loop.run_in_executor(
-            upload_executor, upload_file, file_path, status
-        )
+        slug, elapsed, speed = await loop.run_in_executor(upload_executor, upload_file, file_path)
 
         final_url = f"https://zplayer.io/?v={slug}"
         await status.edit_text(
@@ -132,8 +108,9 @@ async def handle_file(client, message: Message):
 
     except Exception as e:
         await status.edit_text(f"❌ Failed: {e}")
+
     finally:
-        if file_path and os.path.exists(file_path):
+        if os.path.exists(file_path):
             os.remove(file_path)
 
 
@@ -141,5 +118,4 @@ async def handle_file(client, message: Message):
 # Run
 # ----------------------
 if __name__ == "__main__":
-    os.makedirs("./downloads", exist_ok=True)
     bot.run()
