@@ -1,16 +1,18 @@
 import os
 import requests
 
-def upload_to_abyss(file_path=None, api_key=None, progress_callback=None, file_like=None):
-    """
-    Uploads to Abyss. Supports either a real file path (file_path) or a file-like object (file_like)
-    """
-    if file_like:
-        files = {"file": ("video.mp4", file_like, "video/mp4")}
-    elif file_path:
-        f = open(file_path, "rb")
-        files = {"file": (os.path.basename(file_path), f, "video/mp4")}
-    else:
-        raise ValueError("Either file_path or file_like must be provided")
+def upload_to_abyss(file_path: str, api_key: str, progress_callback=None):
+    url = f"http://up.hydrax.net/{api_key}"
 
-    r
+    with open(file_path, "rb") as f:
+        files = {"file": (os.path.basename(file_path), f, "video/mp4")}
+        response = requests.post(url, files=files)
+
+    print("Response text:", response.text)
+    response.raise_for_status()
+
+    try:
+        data = response.json()
+        return data.get("url") or data.get("slug")
+    except Exception:
+        return None
