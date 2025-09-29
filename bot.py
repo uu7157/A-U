@@ -59,14 +59,13 @@ async def edit_progress(message: Message, tag: str, current, total, last_update)
     last_update[message.id] = (now, current)
 
 # ----------------------
-# Wrapper for upload with live progress
+# Wrapper for upload with progress
 # ----------------------
-def upload_with_progress(file_path, api_key, callback=None):
-    total_size = os.path.getsize(file_path)
-    chunk_size = 1024 * 1024  # 1 MB chunks
-    uploaded = 0
-
-    # We wrap the file object to track progress while reading
+def upload_with_progress(file_path, api_key, progress_callback=None):
+    """
+    Calls the existing uploader.py function and updates progress manually.
+    """
+    # Wrap the file to report read bytes
     class ProgressFile:
         def __init__(self, path):
             self.fp = open(path, "rb")
@@ -77,8 +76,8 @@ def upload_with_progress(file_path, api_key, callback=None):
             data = self.fp.read(n)
             if data:
                 self.read_bytes += len(data)
-                if callback:
-                    callback(self.read_bytes, self.size)
+                if progress_callback:
+                    progress_callback(self.read_bytes, self.size)
             return data
 
         def __enter__(self):
@@ -87,7 +86,8 @@ def upload_with_progress(file_path, api_key, callback=None):
         def __exit__(self, exc_type, exc_val, exc_tb):
             self.fp.close()
 
-    def progress_callback(current, total):
+    # Use ProgressFile but call uploader.py normally
+    def progress_report(current, total):
         # call async coroutine from sync thread
         loop = asyncio.get_event_loop()
         asyncio.run_coroutine_threadsafe(
@@ -95,9 +95,7 @@ def upload_with_progress(file_path, api_key, callback=None):
             loop
         )
 
-    # Use the ProgressFile to read in chunks
-    with ProgressFile(file_path) as f:
-        return upload_to_abyss(file_path, api_key, progress_callback=progress_callback)
+    return upload_to_abyss(file_path, api_key, progress_callback=progress_report)
 
 # ----------------------
 # Handler
@@ -113,21 +111,27 @@ async def handle_file(client, message: Message):
     file_path = None
 
     try:
-        # Download with default Pyrogram progress
+        # Download with Pyrogram default progress
         progress_data[status.id] = (0, 0)
         file_path = await message.download(
             file_name=f"./downloads/{file.file_name}",
-            progress=lambda c, t: asyncio.create_task(
-                edit_progress(status, "Downloading", c, t, progress_data)
+            progress=lambda c, t: asyncio.run_coroutine_threadsafe(
+                edit_progress(status, "Downloading", c, t, progress_data),
+                asyncio.get_event_loop()
             )
         )
 
         # Upload with live progress
         progress_data[status.id] = (0, 0)
-        await status.edit_text(f"Uploading {file.file_name}... 0%", quote=True)
+        await status.edit_text(f"Uploading {file.file_name}... 0%")
         loop = asyncio.get_event_loop()
         start_time = time.time()
 
+        # Set status_message for progress callback
+        global status_message
+        status_message = status
+
+        # Run upload in thread executor
         slug = await loop.run_in_executor(
             upload_executor,
             upload_with_progress,
@@ -143,16 +147,18 @@ async def handle_file(client, message: Message):
         await status.edit_text(
             f"✅ Uploaded!\n{final_url}\n"
             f"Avg Upload Speed: {human_readable(speed)}/s\n"
-            f"Time: {int(elapsed)}s",
-            quote=True
+            f"Time: {int(elapsed)}s"
         )
 
     except Exception as e:
-        await status.edit_text(f"❌ Failed: {e}", quote=True)
+        await status.edit_text(f"❌ Failed: {e}")
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
 
+# ----------------------
+# Run
+# ----------------------
 if __name__ == "__main__":
     os.makedirs("./downloads", exist_ok=True)
     bot.run()
