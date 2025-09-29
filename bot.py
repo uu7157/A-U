@@ -77,11 +77,16 @@ async def fast_download(client, message, file_path, parts=3, progress_callback=N
     size = media.file_size
     block_size = 512 * 1024  # 512 KB per chunk
 
-    # Get raw location
+    # Get raw document/video object for MTProto
+    if message.document:
+        raw_doc = message.document._raw
+    else:
+        raw_doc = message.video._raw
+
     file_location = InputDocumentFileLocation(
-        id=media.file_id,
-        access_hash=media.file_access_hash,
-        file_reference=media.file_reference,
+        id=raw_doc.id,
+        access_hash=raw_doc.access_hash,
+        file_reference=raw_doc.file_reference,
         thumb_size=""
     )
 
