@@ -1,7 +1,5 @@
 import os
-import asyncio
 import time
-import shutil
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
@@ -17,19 +15,25 @@ bot = Client(
 )
 
 
-async def progress(current, total, message: Message, action: str, start_time):
+# store last progress update times per message
+last_updates = {}
+
+
+async def update_download_progress(current, total, message: Message):
     now = time.time()
-    if now - start_time < 5:  # update only every 5s
+    last_time = last_updates.get(message.id, 0)
+
+    # only update every 5 seconds or on completion
+    if now - last_time < 5 and current != total:
         return
 
     percent = int(current * 100 / total)
     try:
-        await message.edit_text(f"{action}: {percent}%")
+        await message.edit_text(f"Downloading: {percent}%")
     except:
         pass
 
-    start_time = now
-    return start_time
+    last_updates[message.id] = now
 
 
 @bot.on_message(filters.video | filters.document)
@@ -39,16 +43,15 @@ async def handle_video(client, message: Message):
         return
 
     status = await message.reply_text("Downloading... 0%")
-    start_time = time.time()
 
+    # Download file with progress callback
     file_path = await message.download(
-        progress=lambda c, t: asyncio.create_task(
-            update_download_progress(c, t, status, start_time)
+        progress=lambda c, t: bot.loop.create_task(
+            update_download_progress(c, t, status)
         )
     )
 
     # Upload part
-    start_time = time.time()
     try:
         await status.edit_text("Uploading... 0%")
         slug = upload_to_abyss(file_path, ABYSS_API)
@@ -59,18 +62,6 @@ async def handle_video(client, message: Message):
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
-
-
-async def update_download_progress(current, total, message, last_update):
-    now = time.time()
-    if now - last_update < 5:
-        return
-    percent = int(current * 100 / total)
-    try:
-        await message.edit_text(f"Downloading: {percent}%")
-    except:
-        pass
-    last_update = now
 
 
 if __name__ == "__main__":
