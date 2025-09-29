@@ -2,12 +2,17 @@ import asyncio
 import time
 import os
 import sys
+import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from concurrent.futures import ThreadPoolExecutor
 from uploader import upload_to_abyss
 from custom_dl import TGCustomYield
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 bot = Client("abyss-bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 upload_executor = ThreadPoolExecutor(max_workers=3)
@@ -34,8 +39,6 @@ async def safe_edit(message: Message, text: str):
 # ----------------------
 # Download & upload handler
 # ----------------------
-MAX_CHUNK_SIZE = 10 * 1024 * 1024  # Telegram limit
-
 async def handle_file(message: Message):
     file = message.video or message.document
     if not file:
@@ -43,36 +46,18 @@ async def handle_file(message: Message):
 
     status = await message.reply_text(f"Preparing {file.file_name}...", quote=True)
 
+    local_path = f"./downloads/{file.file_name}"
+    start_time = time.time()
+
     try:
         downloader = TGCustomYield(bot)
 
-        total_size = getattr(file, "file_size", 0)
-        downloaded = 0
-        start_time = time.time()
+        # ✅ New download method with logging inside custom_dl
+        await safe_edit(status, f"⬇️ Downloading {file.file_name}...")
+        await downloader.download_to_file(message, local_path)
 
-        local_path = f"./downloads/{file.file_name}"
-
-        # Download file using TG DC
-        with open(local_path, "wb") as f:
-            async for chunk in downloader.yield_file(
-                media_msg=message,
-                offset=0,
-                first_part_cut=0,
-                last_part_cut=0,
-                part_count=1,
-                chunk_size=min(4 * 1024 * 1024, MAX_CHUNK_SIZE)  # enforce Telegram max chunk
-            ):
-                f.write(chunk)
-                downloaded += len(chunk)
-                percent = int(downloaded * 100 / total_size) if total_size else 0
-                elapsed = time.time() - start_time
-                speed = human_readable(downloaded / elapsed) if elapsed else "0 B"
-                eta = int((total_size - downloaded) / (downloaded / elapsed)) if downloaded else "-"
-                await safe_edit(
-                    status,
-                    f"Downloading {file.file_name}: {percent}%\n"
-                    f"Speed: {speed}/s\nETA: {eta}s"
-                )
+        if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+            raise RuntimeError("Download failed or file is empty")
 
         await safe_edit(status, f"✅ Download complete! Uploading to Abyss...")
 
@@ -96,12 +81,15 @@ async def handle_file(message: Message):
         )
 
     except Exception as e:
-        print("Error handling file:", e, file=sys.stderr)
+        logger.exception("Error handling file")
         await safe_edit(status, f"❌ Failed: {e}")
 
     finally:
         if os.path.exists(local_path):
-            os.remove(local_path)
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
 
 
 @bot.on_message(filters.video | filters.document)
