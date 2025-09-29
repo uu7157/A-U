@@ -34,6 +34,8 @@ async def safe_edit(message: Message, text: str):
 # ----------------------
 # Download & upload handler
 # ----------------------
+MAX_CHUNK_SIZE = 10 * 1024 * 1024  # Telegram limit
+
 async def handle_file(message: Message):
     file = message.video or message.document
     if not file:
@@ -58,7 +60,7 @@ async def handle_file(message: Message):
                 first_part_cut=0,
                 last_part_cut=0,
                 part_count=1,
-                chunk_size=4 * 1024 * 1024
+                chunk_size=min(4 * 1024 * 1024, MAX_CHUNK_SIZE)  # enforce Telegram max chunk
             ):
                 f.write(chunk)
                 downloaded += len(chunk)
