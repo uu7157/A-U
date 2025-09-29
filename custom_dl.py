@@ -1,4 +1,6 @@
 import math
+import os
+import logging
 from typing import Union
 from pyrogram.types import Message
 from pyrogram import Client, utils, raw
@@ -6,19 +8,20 @@ from pyrogram.session import Session, Auth
 from pyrogram.errors import AuthBytesInvalid
 from pyrogram.file_id import FileId, FileType, ThumbnailSource
 
-# Telegram GetFile max chunk limit = 512 KB
-TG_MAX_CHUNK = 512 * 1024  # 524288 bytes
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-async def chunk_size(length: int) -> int:
-    """Calculate optimal chunk size for downloading (but clamp later)."""
-    return 2 ** max(min(math.ceil(math.log2(length / 1024)), 10), 2) * 1024
+def calc_chunk_size(length: int) -> int:
+    """Calculate optimal chunk size for Telegram (max 512 KB)."""
+    suggested = 2 ** max(min(math.ceil(math.log2(length / 1024)), 10), 2) * 1024
+    return min(suggested, 512 * 1024)
 
 
-async def offset_fix(offset: int, chunksize: int) -> int:
+def offset_fix(offset: int, chunksize: int) -> int:
     """Align offset to chunk size."""
-    offset -= offset % chunksize
-    return offset
+    return offset - (offset % chunksize)
 
 
 class TGCustomYield:
@@ -31,7 +34,8 @@ class TGCustomYield:
     @staticmethod
     async def generate_file_properties(msg: Message) -> FileId:
         error_message = "This message doesn't contain any downloadable media"
-        available_media = ("audio", "document", "photo", "sticker", "animation", "video", "voice", "video_note")
+        available_media = ("audio", "document", "photo", "sticker", "animation",
+                           "video", "voice", "video_note")
 
         if isinstance(msg, Message):
             for kind in available_media:
@@ -65,14 +69,17 @@ class TGCustomYield:
             if data.dc_id != await client.storage.dc_id():
                 media_session = Session(
                     client, data.dc_id,
-                    await Auth(client, data.dc_id, await client.storage.test_mode()).create(),
+                    await Auth(client, data.dc_id,
+                               await client.storage.test_mode()).create(),
                     await client.storage.test_mode(),
                     is_media=True
                 )
                 await media_session.start()
 
                 for _ in range(3):
-                    exported_auth = await client.invoke(raw.functions.auth.ExportAuthorization(dc_id=data.dc_id))
+                    exported_auth = await client.invoke(
+                        raw.functions.auth.ExportAuthorization(dc_id=data.dc_id)
+                    )
                     try:
                         await media_session.send(raw.functions.auth.ImportAuthorization(
                             id=exported_auth.id,
@@ -104,7 +111,8 @@ class TGCustomYield:
 
         if file_type == FileType.CHAT_PHOTO:
             if file_id.chat_id > 0:
-                peer = raw.types.InputPeerUser(user_id=file_id.chat_id, access_hash=file_id.chat_access_hash)
+                peer = raw.types.InputPeerUser(user_id=file_id.chat_id,
+                                               access_hash=file_id.chat_access_hash)
             else:
                 if file_id.chat_access_hash == 0:
                     peer = raw.types.InputPeerChat(chat_id=-file_id.chat_id)
@@ -136,69 +144,91 @@ class TGCustomYield:
 
         return location
 
-    async def yield_file(self, media_msg: Message, offset: int, first_part_cut: int,
-                         last_part_cut: int, part_count: int, chunk_size: int) -> Union[bytes, None]:
+    async def yield_file(self, media_msg: Message, offset: int, part_count: int,
+                         chunk_size: int, first_part_cut: int = 0,
+                         last_part_cut: int = 0) -> Union[bytes, None]:
+        """Yield chunks of a Telegram file."""
         client = self.main_bot
         data = await self.generate_file_properties(media_msg)
         media_session = await self.generate_media_session(client, media_msg)
-
-        current_part = 1
         location = await self.get_location(data)
 
-        # Clamp chunk_size to Telegram max
-        chunk_size = min(chunk_size, TG_MAX_CHUNK)
+        current_part = 1
+        try:
+            r = await media_session.send(
+                raw.functions.upload.GetFile(location=location,
+                                             offset=offset,
+                                             limit=chunk_size)
+            )
+        except Exception as e:
+            logger.error(f"GetFile failed: {e}")
+            return
 
-        r = await media_session.send(raw.functions.upload.GetFile(
-            location=location, offset=offset, limit=chunk_size
-        ))
         if not isinstance(r, raw.types.upload.File):
+            logger.error("Telegram did not return a File object")
             return
 
         while current_part <= part_count:
             chunk = getattr(r, "bytes", None)
             if not chunk:
+                logger.warning(f"No chunk received at part {current_part}")
                 break
 
-            offset += len(chunk)  # safe increment
-
+            offset += chunk_size
             if part_count == 1:
-                yield chunk[first_part_cut:last_part_cut]
+                yield chunk[first_part_cut:last_part_cut or None]
                 break
             if current_part == 1:
                 yield chunk[first_part_cut:]
-            elif 1 < current_part <= part_count:
+            elif 1 < current_part < part_count:
                 yield chunk
+            else:  # last part
+                yield chunk[:last_part_cut or None]
 
-            r = await media_session.send(raw.functions.upload.GetFile(
-                location=location, offset=offset, limit=chunk_size
-            ))
+            try:
+                r = await media_session.send(
+                    raw.functions.upload.GetFile(location=location,
+                                                 offset=offset,
+                                                 limit=chunk_size)
+                )
+            except Exception as e:
+                logger.error(f"GetFile failed at offset {offset}: {e}")
+                break
+
             if not isinstance(r, raw.types.upload.File):
+                logger.error(f"Invalid response at offset {offset}")
                 break
 
             current_part += 1
 
-    async def download_as_bytesio(self, media_msg: Message):
-        """Return full file as a list of bytes chunks."""
-        client = self.main_bot
+    async def download_to_file(self, media_msg: Message, dest_path: str) -> str:
+        """Download full file from Telegram into dest_path."""
         data = await self.generate_file_properties(media_msg)
-        media_session = await self.generate_media_session(client, media_msg)
-        location = await self.get_location(data)
+        total_size = getattr(data, "file_size", 0)
+        chunk_size = calc_chunk_size(total_size)
+        part_count = (total_size + chunk_size - 1) // chunk_size
 
-        limit = TG_MAX_CHUNK  # enforce max
-        offset = 0
+        logger.info(f"Downloading {data.file_name} ({total_size} bytes) "
+                    f"in {part_count} parts of {chunk_size} bytes")
 
-        r = await media_session.send(raw.functions.upload.GetFile(location=location, offset=offset, limit=limit))
-        if not isinstance(r, raw.types.upload.File):
-            return []
+        downloaded = 0
+        with open(dest_path, "wb") as f:
+            async for chunk in self.yield_file(
+                media_msg=media_msg,
+                offset=0,
+                part_count=part_count,
+                chunk_size=chunk_size
+            ):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                downloaded += len(chunk)
+                logger.info(f"Progress: {downloaded}/{total_size} "
+                            f"({downloaded * 100 // total_size if total_size else 0}%)")
 
-        m_file = []
-        while True:
-            chunk = getattr(r, "bytes", None)
-            if not chunk:
-                break
-            m_file.append(chunk)
-            offset += len(chunk)
-            r = await media_session.send(raw.functions.upload.GetFile(location=location, offset=offset, limit=limit))
-            if not isinstance(r, raw.types.upload.File):
-                break
-        return m_file
+        if os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+            logger.info(f"Download complete: {dest_path}")
+        else:
+            logger.error(f"Download failed, file is empty: {dest_path}")
+
+        return dest_path
