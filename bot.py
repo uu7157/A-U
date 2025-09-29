@@ -15,28 +15,18 @@ bot = Client(
     bot_token=BOT_TOKEN,
 )
 
-# Executor for blocking uploads
-upload_executor = ThreadPoolExecutor(max_workers=3)  # Adjust as needed
-
-# Store per-message progress info
+upload_executor = ThreadPoolExecutor(max_workers=3)
 progress_data = {}
 
-# ----------------------
-# Utility functions
-# ----------------------
 def human_readable(size):
-    """Convert bytes to human readable format"""
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
             return f"{size:.2f} {unit}"
         size /= 1024
 
-
 async def edit_progress(message: Message, tag: str, current, total, last_update):
     now = time.time()
     last_time, last_bytes = last_update.get(message.id, (0, 0))
-
-    # Update every 2s or on completion
     if now - last_time < 2 and current != total:
         return
 
@@ -65,12 +55,7 @@ async def edit_progress(message: Message, tag: str, current, total, last_update)
 
     last_update[message.id] = (now, current)
 
-
-# ----------------------
-# Upload function
-# ----------------------
 def upload_to_abyss(file_path: str, api_key: str):
-    """Blocking upload function"""
     url = f"http://up.hydrax.net/{api_key}"
     with open(file_path, "rb") as f:
         files = {"file": (os.path.basename(file_path), f, "video/mp4")}
@@ -79,43 +64,43 @@ def upload_to_abyss(file_path: str, api_key: str):
         data = response.json()
         return data.get("url") or data.get("slug")
 
+async def download_file(client: Client, file, status: Message):
+    """Manual chunked download for speed + progress"""
+    file_info = await client.get_file(file.file_id)
+    total = file_info.file_size
+    file_path = f"./downloads/{file.file_name}"
 
-# ----------------------
-# Handler
-# ----------------------
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    current = 0
+    chunk_size = 1024 * 1024  # 1 MB
+    last_update = {status.id: (0, 0)}
+
+    with open(file_path, "wb") as f:
+        for chunk in client.stream_file(file.file_id, chunk_size=chunk_size):
+            f.write(chunk)
+            current += len(chunk)
+            await edit_progress(status, "Downloading", current, total, last_update)
+
+    # Final update
+    await edit_progress(status, "Downloading", total, total, last_update)
+    return file_path
+
 @bot.on_message(filters.video | filters.document)
 async def handle_file(client, message: Message):
     file = message.video or message.document
     if not file:
         return
 
-    # Reply to this specific file
     status = await message.reply_text(f"Downloading {file.file_name}... 0%")
-
-    # Initialize progress tracking for this message
-    progress_data[status.id] = (0, 0)
-
-    # ----------------------
-    # Download with larger chunk size
-    # ----------------------
-    file_path = await client.download_media(
-        file,
-        file_name=f"./downloads/{file.file_name}",
-        progress=lambda current, total: asyncio.create_task(
-            edit_progress(status, "Downloading", current, total, progress_data)
-        ),
-        chunk_size=1024 * 1024  # 1 MB chunks → faster
-    )
-
-    # ----------------------
-    # Upload in executor to avoid blocking
-    # ----------------------
-    progress_data[status.id] = (0, 0)
-    await status.edit_text(f"Uploading {file.file_name}... 0%")
-
-    loop = asyncio.get_event_loop()
-    start_time = time.time()
     try:
+        # Download file manually in chunks
+        file_path = await download_file(client, file, status)
+
+        # Upload using executor to avoid blocking
+        await status.edit_text(f"Uploading {file.file_name}... 0%")
+        loop = asyncio.get_event_loop()
+        start_time = time.time()
         slug = await loop.run_in_executor(upload_executor, upload_to_abyss, file_path, ABYSS_API)
         elapsed = time.time() - start_time
         size = os.path.getsize(file_path)
@@ -128,14 +113,12 @@ async def handle_file(client, message: Message):
             f"Time: {int(elapsed)}s"
         )
     except Exception as e:
-        await status.edit_text(f"❌ Upload failed: {e}")
+        await status.edit_text(f"❌ Failed: {e}")
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
 
-
 if __name__ == "__main__":
-    # Create downloads folder if missing
     if not os.path.exists("./downloads"):
         os.makedirs("./downloads")
     bot.run()
