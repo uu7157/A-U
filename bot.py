@@ -5,13 +5,12 @@ from pyrogram import Client, filters
 from pyrogram.types import Message
 from concurrent.futures import ThreadPoolExecutor
 from uploader import upload_to_abyss  # your existing uploader.py
-from custom_dl import TGCustomYield  # Telegram DC streaming
+from custom_dl import TGCustomYield  # raw DC downloader
 
 from config import APP_ID, API_HASH, BOT_TOKEN, ABYSS_API
 
 bot = Client("abyss-bot", api_id=APP_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 upload_executor = ThreadPoolExecutor(max_workers=3)
-
 
 # ----------------------
 # Utilities
@@ -41,16 +40,14 @@ async def stream_telegram_to_abyss(message: Message):
     status = await message.reply_text(f"Preparing {file.file_name}...", quote=True)
 
     try:
-        downloader = TGCustomYield()
-        downloader.main_bot = bot
+        # Properly pass bot to TGCustomYield
+        downloader = TGCustomYield(bot)
 
         total_size = getattr(file, "file_size", 0)
         downloaded_bytes = 0
         start_time = time.time()
 
-        # ----------------------
-        # Async generator for Telegram chunks
-        # ----------------------
+        # Generator yielding chunks from Telegram DC
         async def chunk_generator():
             nonlocal downloaded_bytes
             async for chunk in downloader.yield_file(
@@ -59,63 +56,47 @@ async def stream_telegram_to_abyss(message: Message):
                 first_part_cut=0,
                 last_part_cut=0,
                 part_count=1,
-                chunk_size=4 * 1024 * 1024,  # 4MB chunks
+                chunk_size=4 * 1024 * 1024  # 4 MB per chunk
             ):
                 downloaded_bytes += len(chunk)
-                elapsed = time.time() - start_time
                 percent = int(downloaded_bytes * 100 / total_size) if total_size else 0
-                speed = human_readable(downloaded_bytes / elapsed) if elapsed > 0 else "0 B"
+                elapsed = max(time.time() - start_time, 0.001)
+                speed = human_readable(downloaded_bytes / elapsed)
                 eta = int((total_size - downloaded_bytes) / (downloaded_bytes / elapsed)) if downloaded_bytes else "-"
                 await safe_edit(
                     status,
-                    f"Downloading {file.file_name}: {percent}%\nSpeed: {speed}/s\nETA: {eta}s"
+                    f"Downloading {file.file_name}: {percent}%\n"
+                    f"Speed: {speed}/s\nETA: {eta}s"
                 )
                 yield chunk
 
         # ----------------------
-        # Streaming wrapper for uploader.py
+        # Upload to Abyss
         # ----------------------
-        class StreamFile:
-            def __init__(self, async_gen):
-                self.async_gen = async_gen.__aiter__()
-                self.buffer = b""
+        def upload_wrapper():
+            # Wrap async chunk generator into iterable for uploader.py
+            class StreamFile:
+                def __init__(self, gen):
+                    self.gen = gen.__aiter__()
 
-            def read(self, n=-1):
-                import asyncio
-                loop = asyncio.get_event_loop()
-                while n == -1 or len(self.buffer) < n:
+                def read(self, n=-1):
                     try:
-                        chunk = loop.run_until_complete(self.async_gen.__anext__())
-                        self.buffer += chunk
+                        return asyncio.run(self.gen.__anext__())
                     except StopAsyncIteration:
-                        break
-                if n == -1:
-                    data, self.buffer = self.buffer, b""
-                else:
-                    data, self.buffer = self.buffer[:n], self.buffer[n:]
-                return data
+                        return b""
 
-        # Progress callback for upload
-        def progress_callback(current, total):
-            percent = int(current * 100 / total) if total else 0
-            asyncio.run_coroutine_threadsafe(
-                safe_edit(status, f"Uploading {file.file_name}: {percent}%"),
-                asyncio.get_event_loop()
-            )
+            stream_file = StreamFile(chunk_generator())
+            # Use your existing uploader.py; ensure it can accept a file-like object
+            return upload_to_abyss(file_path=stream_file, api_key=ABYSS_API)
 
-        # ----------------------
-        # Run upload in ThreadPoolExecutor
-        # ----------------------
         loop = asyncio.get_event_loop()
-        slug = await loop.run_in_executor(
-            upload_executor,
-            lambda: upload_to_abyss(StreamFile(chunk_generator()), ABYSS_API, progress_callback)
-        )
+        slug = await loop.run_in_executor(upload_executor, upload_wrapper)
 
         elapsed = time.time() - start_time
         await safe_edit(
             status,
-            f"✅ Uploaded!\nhttps://zplayer.io/?v={slug}\nTime: {int(elapsed)}s"
+            f"✅ Uploaded!\nhttps://zplayer.io/?v={slug}\n"
+            f"Time: {int(elapsed)}s"
         )
 
     except Exception as e:
@@ -123,16 +104,10 @@ async def stream_telegram_to_abyss(message: Message):
         await safe_edit(status, f"❌ Failed: {e}")
 
 
-# ----------------------
-# Message handler
-# ----------------------
 @bot.on_message(filters.video | filters.document)
 async def handle_message(client, message: Message):
     asyncio.create_task(stream_telegram_to_abyss(message))
 
 
-# ----------------------
-# Run bot
-# ----------------------
 if __name__ == "__main__":
     bot.run()
