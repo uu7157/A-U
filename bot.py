@@ -37,7 +37,7 @@ async def edit_download_progress(message: Message, tag: str, current: int, total
     """Edit message with download progress, speed, ETA."""
     now = time.time()
     last_time, last_bytes = last_update.get(message.id, (start_time, 0))
-    if now - last_time < 1 and current != total:
+    if now - last_time < 5 and current != total:
         return
     diff_bytes = current - last_bytes
     diff_time = now - last_time
